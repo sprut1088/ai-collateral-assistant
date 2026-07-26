@@ -1,0 +1,7 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+anthropic>=0.40
+extract-msg>=0.48
+python-multipart>=0.0.9
+truststore>=0.9
+python-dotenv>=1.0
