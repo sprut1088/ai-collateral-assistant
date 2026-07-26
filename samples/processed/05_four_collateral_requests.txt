@@ -1,0 +1,14 @@
+Hey team,
+
+Please action the following collateral items for tomorrow:
+
+  - Return USD 2,000,000 of the cash collateral currently posted under CSA ref NRM-CSA-4401. We no longer need that full amount posted. Please process same-day if possible.
+  - Substitute part of the remaining cash collateral with UK Gilts, ISIN GB00B03MLX29, nominal GBP 1,800,000, effective value T+1.
+  - Transfer EUR 1,250,000 additional collateral to account CITI-COLL-9931 against the margin call raised this afternoon. Deadline is tomorrow 11:00 London time.
+  - Update settlement instruction for the collateral movement linked to agreement ALP-CSA-7788: use account JPM-SETT-102 and settle on value date T+2.
+
+If anything is unclear, please send a clarification request.
+
+Thanks,
+Anita
+Treasury Operations

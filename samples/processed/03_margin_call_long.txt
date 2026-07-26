@@ -1,0 +1,24 @@
+Hi all,
+
+Hope you had a good weekend! Quick one before I run to another call.
+
+First, thanks for sorting out the reconciliation break from last Thursday - the
+team confirmed it was just a timing difference on the coupon and it's now squared
+away. Appreciate the quick turnaround on that.
+
+Now, onto today. Based on our valuation as of close on Friday, we are issuing a
+variation margin call against you for EUR 12,400,000. The exposure has moved in
+our favour following the rates sell-off and the threshold under the agreement
+(NG-GMRA-2019-08) has been breached. We would expect this to be met by COB
+tomorrow please.
+
+If you'd prefer to meet the call in securities rather than cash, we can accept
+German Bunds - for reference ISIN DE0001102309 is eligible under the schedule.
+Otherwise EUR cash to the usual account is fine.
+
+Also, unrelated, can you confirm whether you'll be sending someone to the ISDA
+working group next month? No rush on that one.
+
+Best,
+Mike
+Northgate Asset Management

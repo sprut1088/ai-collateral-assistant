@@ -1,0 +1,14 @@
+From: Sarah Chen <sarah.chen@meridiancapital.com>
+To: Collateral Ops <collateral.ops@ourbank.com>
+Subject: Collateral substitution request - account MER-CSA-4471
+Date: Tue, 24 Jun 2026 09:12:00 +0100
+
+Hi team,
+
+Under our CSA (account MER-CSA-4471), we'd like to substitute the USD 5,000,000
+cash currently posted as variation margin with US Treasury Notes, ISIN US91282CKQ08,
+nominal USD 5,000,000. Please settle DvP via Fedwire with value date 26 June 2026.
+
+Kind regards,
+Sarah Chen
+Collateral Management, Meridian Capital

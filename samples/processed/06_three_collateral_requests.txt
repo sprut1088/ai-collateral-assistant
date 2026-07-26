@@ -1,0 +1,15 @@
+Hi Collateral Ops,
+
+Please process the following three collateral requests today:
+
+1) Return EUR 1,500,000 of cash collateral currently posted under CSA reference HZN-CSA-2204. Same-day settlement requested if possible.
+
+2) Substitute part of remaining cash with US Treasuries, ISIN US91282CJQ38, nominal USD 2,000,000, effective value T+1.
+
+3) Transfer additional GBP 900,000 collateral to account BARC-COLL-7712 for the outstanding margin call, with deadline by 15:00 London time.
+
+Please confirm once all three are queued.
+
+Regards,
+Meera
+Liquidity & Treasury

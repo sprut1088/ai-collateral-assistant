@@ -1,0 +1,7 @@
+From: Maria Cole <maria.cole@example.com>
+To: Collateral Ops <collateral.ops@ourbank.com>
+Subject: Release collateral instruction
+Date: Fri, 25 Jul 2026 09:10:00 +0000
+
+Please release USD 1,250,000 against ISIN US1234567890 on 2026-08-04.
+Settlement instruction: DvP via Fedwire before 13:00 UTC.
