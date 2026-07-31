@@ -83,6 +83,7 @@ export interface RequestSummary {
   source_mode?: string | null;
   latest_rejection_note?: string | null;
   latest_ask_customer_note?: string | null;
+  latest_approval_note?: string | null;
 }
 
 export interface BatchStatus {
@@ -128,6 +129,16 @@ export interface AppConfig {
   batch_enabled: boolean;
   batch_runtime_root: string;
   truststore_enabled: boolean;
+  cache_entries: number;
+}
+
+export interface ResetDataResult {
+  requests_deleted: number;
+  events_deleted: number;
+  cache_entries_deleted: number;
+  runtime_entries_deleted: number;
+  batch_was_running: boolean;
+  cache_entries_remaining: number;
 }
 
 export interface ConfigUpdate {
@@ -173,24 +184,32 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ entities, case_index: caseIndex }),
     }).then((r) => handle<RequestDetail>(r)),
-  approve: (id: string) =>
-    fetch(`${BASE}/files/${id}/approve`, { method: "POST" }).then((r) => handle<RequestDetail>(r)),
+  approve: (id: string, note: string) =>
+    fetch(`${BASE}/files/${id}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    }).then((r) => handle<RequestDetail>(r)),
   reject: (id: string, note: string) =>
     fetch(`${BASE}/files/${id}/reject`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note }),
     }).then((r) => handle<RequestDetail>(r)),
-  askCustomer: (id: string, note: string) =>
-    fetch(`${BASE}/files/${id}/ask-customer`, {
+  askClarifications: (id: string, note: string) =>
+    fetch(`${BASE}/files/${id}/ask-clarifications`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note }),
     }).then((r) =>
       handle<RequestDetail>(r)
     ),
-  approveCase: (id: string, caseIndex: number) =>
-    fetch(`${BASE}/files/${id}/cases/${caseIndex}/approve`, { method: "POST" }).then((r) =>
+  approveCase: (id: string, caseIndex: number, note: string) =>
+    fetch(`${BASE}/files/${id}/cases/${caseIndex}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    }).then((r) =>
       handle<RequestDetail>(r)
     ),
   rejectCase: (id: string, caseIndex: number, note: string) =>
@@ -201,20 +220,25 @@ export const api = {
     }).then((r) =>
       handle<RequestDetail>(r)
     ),
-  askCustomerCase: (id: string, caseIndex: number, note: string) =>
-    fetch(`${BASE}/files/${id}/cases/${caseIndex}/ask-customer`, {
+  askClarificationsCase: (id: string, caseIndex: number, note: string) =>
+    fetch(`${BASE}/files/${id}/cases/${caseIndex}/ask-clarifications`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ note }),
     }).then((r) =>
       handle<RequestDetail>(r)
     ),
+  askCustomer: (id: string, note: string) =>
+    api.askClarifications(id, note),
+  askCustomerCase: (id: string, caseIndex: number, note: string) =>
+    api.askClarificationsCase(id, caseIndex, note),
   batchStatus: () => fetch(`${BASE}/batch/status`).then((r) => handle<BatchStatus>(r)),
   batchStart: () => fetch(`${BASE}/batch/start`, { method: "POST" }).then((r) => handle<BatchStatus>(r)),
   batchStop: () => fetch(`${BASE}/batch/stop`, { method: "POST" }).then((r) => handle<BatchStatus>(r)),
   batchRunNow: () => fetch(`${BASE}/batch/run-now`, { method: "POST" }).then((r) => handle<BatchStatus>(r)),
   listAudit: (limit = 1000) => fetch(`${BASE}/audit?limit=${limit}`).then((r) => handle<AuditEvent[]>(r)),
   getConfig: () => fetch(`${BASE}/config`).then((r) => handle<AppConfig>(r)),
+  resetData: () => fetch(`${BASE}/admin/reset-data`, { method: "POST" }).then((r) => handle<ResetDataResult>(r)),
   updateConfig: (payload: ConfigUpdate) =>
     fetch(`${BASE}/config`, {
       method: "PUT",

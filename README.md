@@ -15,7 +15,7 @@ An AI add-on layer for collateral operations, designed for future integration wi
 3. **AI extraction** — a real Anthropic Claude API call with forced tool-calling returns schema-compliant JSON: request type (Margin Call, Substitution, Transfer, Settlement, Dispute, Inquiry), customer tone, summary, suggested action, and 11 entity fields (counterparty, account, amount, currency, value date, deadline, ISIN/CUSIP, collateral type, replacement asset, agreement reference, instruction details) — each with a confidence score and a verbatim evidence snippet.
 4. **Deterministic validation** — mandatory fields per request type, ISIN/currency/amount format checks, confidence threshold (70%). Routes to a status: `Ready for Review`, `Missing Mandatory Fields`, or `Low Confidence`.
 5. **File history** — every processed file appears in the left panel with type, status and timestamp; click any file to open its structured data.
-6. **HITL review** — Approve (blocked while mandatory fields are missing), Edit fields (human-confirmed values get 100% confidence, validation re-runs), Ask Customer (Claude drafts a clarification email listing exactly what's missing), Reject. Every action lands on the audit timeline.
+6. **HITL review** — Approve (blocked while mandatory fields are missing), Edit fields (human-confirmed values get 100% confidence, validation re-runs), Ask Clarifications (Claude drafts a clarification email listing exactly what's missing), Reject. Every action lands on the audit timeline.
 
 ## Running it
 
@@ -80,7 +80,7 @@ Open http://localhost:5173 and upload one of the files in `samples/`:
 |---|---|
 | `01_collateral_substitution.txt` | Clean extraction → Ready for Review → Approve |
 | `02_margin_call_dispute.txt` | Dispute classification + escalation tone detection |
-| `03_incomplete_transfer.txt` | Missing mandatory fields → Ask Customer clarification draft |
+| `03_incomplete_transfer.txt` | Missing mandatory fields → Ask Clarifications draft |
 
 Batch runtime folders are created automatically if missing.
 
@@ -115,7 +115,7 @@ cd backend && python -m pytest tests/ -v
 | PATCH | `/api/files/{id}/entities` | HITL field edits (re-validates) |
 | POST | `/api/files/{id}/approve` | Approve for Colline submission (draft mode) |
 | POST | `/api/files/{id}/reject` | Reject |
-| POST | `/api/files/{id}/ask-customer` | Draft clarification email |
+| POST | `/api/files/{id}/ask-clarifications` | Draft clarification email |
 | GET | `/api/batch/status` | Batch runner status + folder stats |
 | POST | `/api/batch/start` | Start 30-second inbox polling |
 | POST | `/api/batch/stop` | Stop batch polling |

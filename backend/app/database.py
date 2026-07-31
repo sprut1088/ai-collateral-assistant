@@ -10,8 +10,32 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
-DB_PATH = os.environ.get("ACOA_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "acoa.db"))
+
+def _resolve_db_path() -> Path:
+    app_dir = Path(__file__).resolve().parent
+    backend_dir = app_dir.parent
+    project_dir = backend_dir.parent
+
+    configured = os.environ.get("ACOA_DB_PATH", "").strip()
+    if configured:
+        candidate = Path(configured)
+        if candidate.is_absolute():
+            return candidate
+
+        # Prefer project-root relative resolution for values like "backend/acoa.db".
+        project_relative = (project_dir / candidate).resolve()
+        if project_relative.parent.exists():
+            return project_relative
+
+        # Fallback to backend-root relative.
+        return (backend_dir / candidate).resolve()
+
+    return (backend_dir / "acoa.db").resolve()
+
+
+DB_PATH = _resolve_db_path()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -40,6 +64,15 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT,
     FOREIGN KEY (request_id) REFERENCES requests (id)
 );
+CREATE TABLE IF NOT EXISTS evaluation_cache (
+    content_hash TEXT PRIMARY KEY,
+    extraction TEXT NOT NULL,
+    validation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 REQUEST_OPTIONAL_COLUMNS = {
@@ -63,7 +96,8 @@ def _ensure_request_columns(conn: sqlite3.Connection) -> None:
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _ensure_request_columns(conn)
@@ -130,6 +164,97 @@ def has_content_hash(content_hash: str) -> bool:
     return bool(row)
 
 
+def get_cached_evaluation(content_hash: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT extraction, validation, status
+            FROM evaluation_cache
+            WHERE content_hash = ?
+            LIMIT 1
+            """,
+            (content_hash,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            """
+            UPDATE evaluation_cache
+            SET hit_count = hit_count + 1,
+                updated_at = ?
+            WHERE content_hash = ?
+            """,
+            (now_iso(), content_hash),
+        )
+    return {
+        "extraction": json.loads(row["extraction"]),
+        "validation": json.loads(row["validation"]),
+        "status": row["status"],
+    }
+
+
+def upsert_cached_evaluation(
+    content_hash: str,
+    extraction: dict,
+    validation_result: dict,
+    status: str,
+) -> None:
+    ts = now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO evaluation_cache (
+                content_hash,
+                extraction,
+                validation,
+                status,
+                created_at,
+                updated_at,
+                hit_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(content_hash) DO UPDATE SET
+                extraction = excluded.extraction,
+                validation = excluded.validation,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (
+                content_hash,
+                json.dumps(extraction),
+                json.dumps(validation_result),
+                status,
+                ts,
+                ts,
+            ),
+        )
+
+
+def count_cached_evaluations() -> int:
+    with get_conn() as conn:
+        row = conn.execute("SELECT COUNT(1) AS cnt FROM evaluation_cache").fetchone()
+    return int(row["cnt"] if row else 0)
+
+
+def reset_application_data() -> dict:
+    with get_conn() as conn:
+        requests_deleted = conn.execute("SELECT COUNT(1) AS cnt FROM requests").fetchone()["cnt"]
+        events_deleted = conn.execute("SELECT COUNT(1) AS cnt FROM events").fetchone()["cnt"]
+        cache_entries_deleted = conn.execute(
+            "SELECT COUNT(1) AS cnt FROM evaluation_cache"
+        ).fetchone()["cnt"]
+
+        conn.execute("DELETE FROM events")
+        conn.execute("DELETE FROM requests")
+        conn.execute("DELETE FROM evaluation_cache")
+
+    return {
+        "requests_deleted": int(requests_deleted or 0),
+        "events_deleted": int(events_deleted or 0),
+        "cache_entries_deleted": int(cache_entries_deleted or 0),
+    }
+
+
 def _row_to_dict(row: sqlite3.Row, full: bool = True) -> dict:
     d = dict(row)
     for key in ("raw_email", "extraction", "validation"):
@@ -181,6 +306,7 @@ def list_requests() -> list[dict]:
         for item in summaries:
             item["latest_rejection_note"] = None
             item["latest_ask_customer_note"] = None
+            item["latest_approval_note"] = None
 
         req_ids = [item["id"] for item in summaries]
         placeholders = ",".join("?" for _ in req_ids)
@@ -190,6 +316,8 @@ def list_requests() -> list[dict]:
             FROM events
             WHERE request_id IN ({placeholders})
               AND event_type IN (
+                                'approved',
+                                'case_approved',
                 'rejected',
                 'case_rejected',
                 'clarification_drafted',
@@ -210,7 +338,9 @@ def list_requests() -> list[dict]:
         if not note:
             continue
 
-        if row["event_type"] in ("rejected", "case_rejected"):
+        if row["event_type"] in ("approved", "case_approved"):
+            item["latest_approval_note"] = note
+        elif row["event_type"] in ("rejected", "case_rejected"):
             item["latest_rejection_note"] = note
         else:
             item["latest_ask_customer_note"] = note

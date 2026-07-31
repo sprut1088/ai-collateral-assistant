@@ -13,8 +13,9 @@ const FIELD_LABELS: Record<string, string> = {
   collateral_type: "Existing collateral",
   replacement_asset: "Replacement asset",
   agreement_reference: "Agreement reference",
-  instruction_details: "Instruction details",
 };
+
+const HIDDEN_ENTITY_KEYS = new Set(["instruction_details"]);
 
 const MANDATORY_BY_TYPE: Record<string, string[]> = {
   "Margin Call": ["counterparty", "amount", "currency"],
@@ -25,6 +26,13 @@ const MANDATORY_BY_TYPE: Record<string, string[]> = {
   "Exposure Inquiry": ["counterparty"],
   "General Inquiry": [],
 };
+
+const LOCKED_DECISION_STATES = new Set([
+  "Approved",
+  "Rejected",
+  "Awaiting Clarifications",
+  "Awaiting Customer",
+]);
 
 function confidenceBand(conf: number): string {
   if (conf >= 0.9) return "High";
@@ -65,6 +73,29 @@ function extractCases(extraction: Extraction): ExtractionCase[] {
   return [buildFallbackCase(extraction)];
 }
 
+function isEditedEvidence(evidence: string | null | undefined): boolean {
+  if (!evidence) return false;
+  return evidence.includes("Old Value:") && evidence.includes("New Value:");
+}
+
+function renderEvidenceCell(evidence: string | null | undefined) {
+  if (!evidence) return "-";
+  if (!isEditedEvidence(evidence)) return evidence;
+
+  const parts = evidence.split(" | ").map((part) => part.trim());
+  const oldPart = parts.find((part) => part.startsWith("Old Value:"));
+  const newPart = parts.find((part) => part.startsWith("New Value:"));
+  const editPart = parts.find((part) => part.startsWith("Edited by"));
+
+  return (
+    <>
+      {oldPart && <span className="evidence-edit-line">{oldPart}</span>}
+      {newPart && <span className="evidence-edit-line">{newPart}</span>}
+      <span className="evidence-edit-line">{editPart || "Edited by Operation User"}</span>
+    </>
+  );
+}
+
 export function DetailView({
   detail,
   onChange,
@@ -75,20 +106,17 @@ export function DetailView({
   onError: (msg: string | null) => void;
 }) {
   const [approvePrompt, setApprovePrompt] = useState<{
-    scope: "request" | "case";
-    caseIndex: number;
     classification: string;
     missingFields: string[];
   } | null>(null);
   const [actionPrompt, setActionPrompt] = useState<{
-    scope: "request" | "case";
-    action: "ask" | "reject";
-    caseIndex: number;
+    action: "ask" | "reject" | "approve";
     note: string;
   } | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
-  const [showUnavailable, setShowUnavailable] = useState(false);
+  const [showUnavailableByCase, setShowUnavailableByCase] = useState<Record<number, boolean>>({});
+  const [successNotice, setSuccessNotice] = useState<{ title: string; message: string } | null>(null);
 
   const ext = detail.extraction;
   const val = detail.validation;
@@ -96,6 +124,10 @@ export function DetailView({
     detail.status === "Approved" ||
     detail.status === "Rejected" ||
     detail.status === "Not a collateral request";
+  const requestLocked =
+    terminal ||
+    detail.status === "Awaiting Clarifications" ||
+    detail.status === "Awaiting Customer";
 
   const cases = useMemo(() => {
     if (!ext) return [];
@@ -112,6 +144,7 @@ export function DetailView({
     const next: Record<string, string> = {};
     cases.forEach((caseItem, caseIndex) => {
       for (const [key, field] of Object.entries(caseItem.entities || {})) {
+        if (HIDDEN_ENTITY_KEYS.has(key)) continue;
         const raw = field.value ?? "";
         next[`${caseIndex}:${key}`] = key === "amount" ? formatAmountDisplay(raw) : raw;
       }
@@ -119,10 +152,17 @@ export function DetailView({
     setDrafts(next);
   }, [detail.id, ext, cases]);
 
+  useEffect(() => {
+    setShowUnavailableByCase({});
+  }, [detail.id]);
+
   const caseRows = useMemo(() => {
     return cases.map((caseItem, caseIndex) => {
+      const showUnavailable = Boolean(showUnavailableByCase[caseIndex]);
       const mandatory = new Set(MANDATORY_BY_TYPE[caseItem.request_type] || []);
-      const rows = Object.entries(caseItem.entities || {}).map(([key, field]) => {
+      const rows = Object.entries(caseItem.entities || {})
+        .filter(([key]) => !HIDDEN_ENTITY_KEYS.has(key))
+        .map(([key, field]) => {
         const absent = field.value == null || field.value === "";
         return {
           key,
@@ -131,26 +171,34 @@ export function DetailView({
           mandatory: mandatory.has(key),
           draftKey: `${caseIndex}:${key}`,
         };
-      });
+        });
       return {
         caseItem,
         caseIndex,
+        showUnavailable,
         rows,
         visibleRows: rows.filter((r) => showUnavailable || !r.absent),
+        hiddenCount: rows.filter((r) => r.absent).length,
+        hasEditedRows: rows.some((r) => isEditedEvidence(r.field.evidence)),
       };
     });
-  }, [cases, showUnavailable]);
+  }, [cases, showUnavailableByCase]);
 
-  const hiddenCount = caseRows.reduce(
-    (acc, item) => acc + (item.rows.length - item.visibleRows.length),
-    0
-  );
-
-  const run = async (label: string, fn: () => Promise<RequestDetail>) => {
+  const run = async (
+    label: string,
+    fn: () => Promise<RequestDetail>,
+    successMessage?: string
+  ) => {
     setBusy(label);
     onError(null);
     try {
       onChange(await fn());
+      if (successMessage) {
+        setSuccessNotice({
+          title: "Action completed",
+          message: successMessage,
+        });
+      }
     } catch (e: any) {
       onError(e.message);
     } finally {
@@ -158,107 +206,122 @@ export function DetailView({
     }
   };
 
-  const saveEdit = () =>
-    run("save", async () => {
-      if (!ext) return detail;
-      let hasChanges = false;
+  const normalizedEntityValue = (fieldName: string, value: string): string =>
+    fieldName === "amount" ? normalizeAmountForSave(value) : value;
 
-      for (const [caseIndex, caseItem] of cases.entries()) {
-        const updates: Record<string, string> = {};
-        for (const [fieldName, field] of Object.entries(caseItem.entities || {})) {
-          const key = `${caseIndex}:${fieldName}`;
-          const currentValue = field.value ?? "";
-          const draftValue = drafts[key] ?? "";
-          const normalizedCurrent =
-            fieldName === "amount" ? normalizeAmountForSave(currentValue) : currentValue;
-          const normalizedDraft =
-            fieldName === "amount" ? normalizeAmountForSave(draftValue) : draftValue;
-          if (normalizedDraft !== normalizedCurrent) {
-            updates[fieldName] = normalizedDraft;
-          }
-        }
-        if (Object.keys(updates).length > 0) {
-          hasChanges = true;
-          await api.editEntities(detail.id, updates, caseIndex);
-        }
+  const hasFieldUpdate = (
+    caseIndex: number,
+    fieldName: string,
+    caseItem: ExtractionCase
+  ): boolean => {
+    const key = `${caseIndex}:${fieldName}`;
+    const currentValue = caseItem.entities?.[fieldName]?.value ?? "";
+    const draftValue = drafts[key] ?? "";
+    return (
+      normalizedEntityValue(fieldName, draftValue) !==
+      normalizedEntityValue(fieldName, currentValue)
+    );
+  };
+
+  const updatesForCase = (caseIndex: number, caseItem: ExtractionCase): Record<string, string> => {
+    const updates: Record<string, string> = {};
+    for (const [fieldName, field] of Object.entries(caseItem.entities || {})) {
+      if (HIDDEN_ENTITY_KEYS.has(fieldName)) continue;
+      const key = `${caseIndex}:${fieldName}`;
+      const currentValue = field.value ?? "";
+      const draftValue = drafts[key] ?? "";
+      const normalizedCurrent =
+        fieldName === "amount" ? normalizeAmountForSave(currentValue) : currentValue;
+      const normalizedDraft =
+        fieldName === "amount" ? normalizeAmountForSave(draftValue) : draftValue;
+      if (normalizedDraft !== normalizedCurrent) {
+        updates[fieldName] = normalizedDraft;
       }
+    }
+    return updates;
+  };
 
-      if (!hasChanges) {
+  const saveCaseEdit = (caseIndex: number) =>
+    run(`save-${caseIndex}`, async () => {
+      if (!ext) return detail;
+      const caseItem = cases[caseIndex];
+      if (!caseItem) return detail;
+
+      const updates = updatesForCase(caseIndex, caseItem);
+      if (Object.keys(updates).length === 0) {
         return detail;
       }
-      return api.getFile(detail.id);
-    });
 
-  const requestCaseApproval = (
-    caseIndex: number,
-    classification: string,
-    missingFields: string[]
-  ) => {
-    if (missingFields.length > 0) {
-      setApprovePrompt({ scope: "case", caseIndex, classification, missingFields });
-      return;
-    }
-    run(`approve-${caseIndex}`, () => api.approveCase(detail.id, caseIndex));
-  };
+      await api.editEntities(detail.id, updates, caseIndex);
+      return api.getFile(detail.id);
+    }, "Case updates saved successfully.");
+
+  const saveFieldEdit = (caseIndex: number, fieldName: string, caseItem: ExtractionCase) =>
+    run(`save-field-${caseIndex}:${fieldName}`, async () => {
+      if (!ext) return detail;
+      const draftKey = `${caseIndex}:${fieldName}`;
+      const currentValue = caseItem.entities?.[fieldName]?.value ?? "";
+      const draftValue = drafts[draftKey] ?? "";
+      const normalizedCurrent = normalizedEntityValue(fieldName, currentValue);
+      const normalizedDraft = normalizedEntityValue(fieldName, draftValue);
+      if (normalizedDraft === normalizedCurrent) {
+        return detail;
+      }
+
+      await api.editEntities(detail.id, { [fieldName]: normalizedDraft }, caseIndex);
+      return api.getFile(detail.id);
+    }, `${FIELD_LABELS[fieldName] || fieldName} saved successfully.`);
 
   const requestApproval = () => {
     if (!ext) return;
     const missingFields = val?.missing_fields || [];
     if (missingFields.length > 0) {
       setApprovePrompt({
-        scope: "request",
-        caseIndex: -1,
         classification: ext.request_type,
         missingFields,
       });
       return;
     }
-    run("approve", () => api.approve(detail.id));
+    openActionPrompt("approve");
   };
 
-  const openActionPrompt = (
-    scope: "request" | "case",
-    action: "ask" | "reject",
-    caseIndex = -1
-  ) => {
-    setActionPrompt({ scope, action, caseIndex, note: "" });
+  const openActionPrompt = (action: "ask" | "reject" | "approve") => {
+    setActionPrompt({ action, note: "" });
   };
 
   const confirmActionPrompt = async () => {
     if (!actionPrompt) return;
     const note = actionPrompt.note.trim();
     if (!note) {
-      onError(actionPrompt.action === "ask" ? "Ask-customer note is required." : "Rejection note is required.");
-      return;
-    }
-
-    const { scope, action, caseIndex } = actionPrompt;
-    setActionPrompt(null);
-    if (scope === "case") {
-      if (action === "ask") {
-        await run(`ask-${caseIndex}`, () => api.askCustomerCase(detail.id, caseIndex, note));
+      if (actionPrompt.action === "ask") {
+        onError("Ask clarifications note is required.");
+      } else if (actionPrompt.action === "approve") {
+        onError("Approval note is required.");
       } else {
-        await run(`reject-${caseIndex}`, () => api.rejectCase(detail.id, caseIndex, note));
+        onError("Rejection note is required.");
       }
       return;
     }
 
+    const { action } = actionPrompt;
+    setActionPrompt(null);
     if (action === "ask") {
-      await run("ask", () => api.askCustomer(detail.id, note));
+      await run(
+        "ask",
+        () => api.askClarifications(detail.id, note),
+        "Request marked for clarification successfully."
+      );
+    } else if (action === "approve") {
+      await run("approve", () => api.approve(detail.id, note), "Request approved successfully.");
     } else {
-      await run("reject", () => api.reject(detail.id, note));
+      await run("reject", () => api.reject(detail.id, note), "Request rejected successfully.");
     }
   };
 
   const confirmCaseApproval = async () => {
     if (!approvePrompt) return;
-    const { caseIndex: idx, scope } = approvePrompt;
     setApprovePrompt(null);
-    if (scope === "case") {
-      await run(`approve-${idx}`, () => api.approveCase(detail.id, idx));
-      return;
-    }
-    await run("approve", () => api.approve(detail.id));
+    openActionPrompt("approve");
   };
 
   if (!ext) {
@@ -303,19 +366,19 @@ export function DetailView({
             {ext.multiple_requests_detected && (
               <span className="case-count-chip">Multiple requests detected ({cases.length})</span>
             )}
-            <button className="toggle-link" onClick={() => setShowUnavailable((v) => !v)}>
-              {showUnavailable
-                ? "Hide unavailable fields"
-                : `Show unavailable fields${hiddenCount ? ` (${hiddenCount})` : ""}`}
-            </button>
           </div>
         </div>
       </div>
 
-      {caseRows.map(({ caseItem, caseIndex, visibleRows }) => {
+      <details className="preview-block" style={{ marginTop: 4 }}>
+        <summary>Preview extracted body</summary>
+        <pre>{detail.raw_email?.body?.trim() || "No parsed email body available for this record."}</pre>
+      </details>
+
+      {caseRows.map(({ caseItem, caseIndex, visibleRows, showUnavailable, hiddenCount, hasEditedRows }) => {
         const caseValidation = val?.cases?.find((c) => c.case_index === caseIndex);
         const decision = caseItem.decision_status || "Pending Review";
-        const caseTerminal = decision === "Approved" || decision === "Rejected";
+        const caseLocked = LOCKED_DECISION_STATES.has(decision);
         return (
           <section className="case-section" key={`case-${caseIndex}`}>
             <div className="case-section-head">
@@ -328,6 +391,19 @@ export function DetailView({
                 </span>
                 <span className="case-decision-chip">{decision}</span>
                 {caseValidation && <span className="case-status-chip">{caseValidation.status}</span>}
+                <button
+                  className="toggle-link"
+                  onClick={() =>
+                    setShowUnavailableByCase((prev) => ({
+                      ...prev,
+                      [caseIndex]: !showUnavailable,
+                    }))
+                  }
+                >
+                  {showUnavailable
+                    ? "Hide unavailable fields"
+                    : `Show unavailable fields${hiddenCount ? ` (${hiddenCount})` : ""}`}
+                </button>
               </div>
             </div>
             {caseItem.summary && <p className="case-summary">{caseItem.summary}</p>}
@@ -376,26 +452,43 @@ export function DetailView({
                             </div>
                           </div>
                         </td>
-                        <td className="mono evidence-cell">{row.field.evidence || "-"}</td>
+                        <td className="mono evidence-cell">{renderEvidenceCell(row.field.evidence)}</td>
                         <td className="edit-cell">
-                          <input
-                            className="table-edit-input"
-                            value={drafts[row.draftKey] ?? ""}
-                            onChange={(e) =>
-                              setDrafts((d) => ({
-                                ...d,
-                                [row.draftKey]: e.target.value,
-                              }))
-                            }
-                            onBlur={() => {
-                              if (row.key !== "amount") return;
-                              setDrafts((d) => ({
-                                ...d,
-                                [row.draftKey]: formatAmountDisplay(d[row.draftKey] ?? ""),
-                              }));
-                            }}
-                            disabled={terminal || busy !== null}
-                          />
+                          <div className="inline-edit-control">
+                            <input
+                              className="table-edit-input"
+                              value={drafts[row.draftKey] ?? ""}
+                              onChange={(e) =>
+                                setDrafts((d) => ({
+                                  ...d,
+                                  [row.draftKey]: e.target.value,
+                                }))
+                              }
+                              onBlur={() => {
+                                if (row.key !== "amount") return;
+                                setDrafts((d) => ({
+                                  ...d,
+                                  [row.draftKey]: formatAmountDisplay(d[row.draftKey] ?? ""),
+                                }));
+                              }}
+                              disabled={requestLocked || busy !== null || caseLocked}
+                            />
+                            <button
+                              type="button"
+                              className="field-save-btn"
+                              title={`Save ${FIELD_LABELS[row.key] || row.key}`}
+                              aria-label={`Save ${FIELD_LABELS[row.key] || row.key}`}
+                              onClick={() => saveFieldEdit(caseIndex, row.key, caseItem)}
+                              disabled={
+                                requestLocked ||
+                                busy !== null ||
+                                caseLocked ||
+                                !hasFieldUpdate(caseIndex, row.key, caseItem)
+                              }
+                            >
+                              {busy === `save-field-${caseIndex}:${row.key}` ? "..." : "✓"}
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -404,47 +497,13 @@ export function DetailView({
               </table>
             </div>
 
+            {hasEditedRows && <div className="edit-remark">Edited by operations user</div>}
+
             {caseItem.clarification_draft && (
               <details className="preview-block" style={{ marginTop: 8 }}>
-                <summary>Case clarification email draft</summary>
+                <summary>Suggested Clarification Email</summary>
                 <pre>{caseItem.clarification_draft}</pre>
               </details>
-            )}
-
-            {multiCase && (
-              <div className="case-actions-row">
-                <button
-                  className="btn approve"
-                  disabled={
-                    terminal ||
-                    busy !== null ||
-                    caseTerminal
-                  }
-                  onClick={() =>
-                    requestCaseApproval(
-                      caseIndex,
-                      caseItem.request_type,
-                      caseValidation?.missing_fields || []
-                    )
-                  }
-                >
-                  {busy === `approve-${caseIndex}` ? "Approving..." : "Approve case"}
-                </button>
-                <button
-                  className="btn ask"
-                  disabled={terminal || busy !== null || caseTerminal}
-                  onClick={() => openActionPrompt("case", "ask", caseIndex)}
-                >
-                  {busy === `ask-${caseIndex}` ? "Drafting..." : "Ask clarification"}
-                </button>
-                <button
-                  className="btn reject"
-                  disabled={terminal || busy !== null || caseTerminal}
-                  onClick={() => openActionPrompt("case", "reject", caseIndex)}
-                >
-                  Reject case
-                </button>
-              </div>
             )}
           </section>
         );
@@ -452,7 +511,7 @@ export function DetailView({
 
       {detail.clarification_draft && (
         <details className="preview-block" style={{ marginTop: 12 }}>
-          <summary>Clarification email draft</summary>
+          <summary>Suggested Clarification Email</summary>
           <pre>{detail.clarification_draft}</pre>
         </details>
       )}
@@ -489,11 +548,17 @@ export function DetailView({
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="Provide action note">
           <div className="modal-card">
             <h3>
-              {actionPrompt.action === "ask" ? "Add clarification note" : "Add rejection note"}
+              {actionPrompt.action === "ask"
+                ? "Add clarification note"
+                : actionPrompt.action === "approve"
+                  ? "Add approval note"
+                  : "Add rejection note"}
             </h3>
             <p>
               {actionPrompt.action === "ask"
-                ? "A note is mandatory before sending this item to Ask Customer."
+                ? "A note is mandatory before sending this item to Ask Clarifications."
+                : actionPrompt.action === "approve"
+                  ? "A note is mandatory before approving this item."
                 : "A note is mandatory before rejecting this item."}
             </p>
             <textarea
@@ -518,40 +583,56 @@ export function DetailView({
         </div>
       )}
 
+      {successNotice && (
+        <div
+          className="modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Action success notification"
+          onClick={() => setSuccessNotice(null)}
+        >
+          <div className="modal-card notice-card" onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              className="notice-close"
+              aria-label="Close notification"
+              onClick={() => setSuccessNotice(null)}
+            >
+              ×
+            </button>
+            <h3>{successNotice.title}</h3>
+            <p>{successNotice.message}</p>
+          </div>
+        </div>
+      )}
+
       <div className="review-actions-row">
         <div className="review-actions">
-          <button className="btn save" disabled={terminal || busy !== null} onClick={saveEdit}>
-            {busy === "save" ? "Saving..." : "Save changes"}
+          <button
+            className="btn approve"
+            disabled={
+              requestLocked ||
+              busy !== null ||
+              detail.status === "Not a collateral request"
+            }
+            onClick={requestApproval}
+          >
+            {busy === "approve" ? "Approving..." : multiCase ? "Approve Case" : "Approve"}
           </button>
-          {!multiCase && (
-            <>
-              <button
-                className="btn approve"
-                disabled={
-                  terminal ||
-                  busy !== null ||
-                  detail.status === "Not a collateral request"
-                }
-                onClick={requestApproval}
-              >
-                {busy === "approve" ? "Approving..." : "Approve"}
-              </button>
-              <button
-                className="btn ask"
-                disabled={terminal || busy !== null}
-                onClick={() => openActionPrompt("request", "ask")}
-              >
-                {busy === "ask" ? "Drafting..." : "Ask clarification"}
-              </button>
-              <button
-                className="btn reject"
-                disabled={terminal || busy !== null}
-                onClick={() => openActionPrompt("request", "reject")}
-              >
-                Reject
-              </button>
-            </>
-          )}
+          <button
+            className="btn ask"
+            disabled={requestLocked || busy !== null}
+            onClick={() => openActionPrompt("ask")}
+          >
+            {busy === "ask" ? "Drafting..." : "Ask Clarifications"}
+          </button>
+          <button
+            className="btn reject"
+            disabled={requestLocked || busy !== null}
+            onClick={() => openActionPrompt("reject")}
+          >
+            {multiCase ? "Reject Case" : "Reject"}
+          </button>
         </div>
       </div>
     </div>

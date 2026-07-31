@@ -1,7 +1,7 @@
 """AI Collateral Operations Assistant — API.
 
 Lifecycle: upload -> parse -> Claude extraction -> deterministic validation
--> HITL review (approve / edit / reject / ask customer) -> (future) Colline
+-> HITL review (approve / edit / reject / ask clarifications) -> (future) Colline
 integration layer.
 """
 import json
@@ -31,6 +31,7 @@ BATCH_RUNTIME_ROOT = os.environ.get(
     r"C:\git_repos\ai-collateral-assistant\samples",
 )
 BATCH_INTERVAL_SECONDS = int(os.environ.get("ACOA_BATCH_INTERVAL_SECONDS", "30"))
+AWAITING_CLARIFICATIONS_STATUS = "Awaiting Clarifications"
 
 
 class EntitiesPatch(BaseModel):
@@ -50,6 +51,10 @@ class ConfigUpdate(BaseModel):
     use_truststore: bool | None = None
 
 
+def _evaluation_cache_enabled() -> bool:
+    return os.environ.get("ACOA_ENABLE_EVAL_CACHE", "1") != "0"
+
+
 def _mask_api_key(value: str | None) -> str:
     if not value:
         return "Not configured"
@@ -65,6 +70,32 @@ def _multi_case_extraction(extraction: dict | None) -> list[dict]:
     return cases if isinstance(cases, list) else []
 
 
+def _case_has_any_value(case: dict | None) -> bool:
+    if not isinstance(case, dict):
+        return False
+    entities = case.get("entities")
+    if not isinstance(entities, dict):
+        return False
+    for slot in entities.values():
+        if isinstance(slot, dict) and slot.get("value") not in (None, ""):
+            return True
+    return False
+
+
+def _extraction_needs_recovery(extraction: dict | None) -> bool:
+    if not isinstance(extraction, dict):
+        return True
+    if extraction.get("collateral_request_detected") is False:
+        return False
+
+    cases = _multi_case_extraction(extraction)
+    if not cases:
+        if _case_has_any_value({"entities": extraction.get("entities")}):
+            return False
+        return True
+    return all(not _case_has_any_value(case) for case in cases)
+
+
 def _derive_request_status_for_cases(validation_status: str, cases: list[dict]) -> str:
     if not cases:
         return validation_status
@@ -74,8 +105,8 @@ def _derive_request_status_for_cases(validation_status: str, cases: list[dict]) 
         return "Approved"
     if decisions and all(d == "Rejected" for d in decisions):
         return "Rejected"
-    if any(d == "Awaiting Customer" for d in decisions):
-        return "Awaiting Customer"
+    if any(d in {AWAITING_CLARIFICATIONS_STATUS, "Awaiting Customer"} for d in decisions):
+        return AWAITING_CLARIFICATIONS_STATUS
     return validation_status
 
 
@@ -104,7 +135,7 @@ def _update_request_after_case_action(req_id: str, extraction: dict, validation_
     elif status == "Rejected":
         update_fields["rejected_at"] = db.now_iso()
         update_fields["approved_at"] = None
-    elif status == "Awaiting Customer":
+    elif status == AWAITING_CLARIFICATIONS_STATUS:
         update_fields["clarification_requested_at"] = db.now_iso()
     db.update_request(req_id, **update_fields)
     return db.get_request(req_id)
@@ -129,6 +160,47 @@ def _process_email_content(
         source_mode=source_mode,
         source_path=source_path,
     )
+
+    if _evaluation_cache_enabled():
+        cached_eval = db.get_cached_evaluation(content_hash)
+        if cached_eval:
+            cached_extraction = cached_eval.get("extraction")
+            if isinstance(cached_extraction, dict):
+                try:
+                    normalized_cached_extraction = extractor._normalize_extraction_result(cached_extraction)
+                except Exception:
+                    normalized_cached_extraction = cached_extraction
+            else:
+                normalized_cached_extraction = cached_extraction
+
+            if _extraction_needs_recovery(cached_eval.get("extraction")):
+                db.add_event(
+                    req_id,
+                    "cache_skip",
+                    "Skipped cached extraction due to empty structured case entities; reprocessing.",
+                )
+            else:
+                if normalized_cached_extraction != cached_extraction and isinstance(normalized_cached_extraction, dict):
+                    db.upsert_cached_evaluation(
+                        content_hash,
+                        normalized_cached_extraction,
+                        cached_eval["validation"],
+                        cached_eval["status"],
+                    )
+                db.update_request(
+                    req_id,
+                    extraction=normalized_cached_extraction,
+                    validation=cached_eval["validation"],
+                    status=cached_eval["status"],
+                    error=None,
+                )
+                db.add_event(
+                    req_id,
+                    "cache_hit",
+                    "Reused cached extraction and validation for identical email content hash.",
+                )
+                return db.get_request(req_id)
+
     try:
         extraction = extractor.extract(raw_email)
         if not extraction.get("collateral_request_detected", True):
@@ -148,6 +220,8 @@ def _process_email_content(
             )
         result = validation.validate(raw_email, extraction)
         db.update_request(req_id, extraction=extraction, validation=result, status=result["status"])
+        if _evaluation_cache_enabled():
+            db.upsert_cached_evaluation(content_hash, extraction, result, result["status"])
         db.add_event(req_id, "validation", f"Validation result: {result['status']}")
     except Exception as e:
         db.update_request(req_id, status="Processing Failed", error=str(e))
@@ -223,6 +297,8 @@ def get_config():
         "batch_enabled": batch_state["running"],
         "batch_runtime_root": batch_state["runtime_root"],
         "truststore_enabled": os.environ.get("ACOA_USE_TRUSTSTORE") == "1",
+        "evaluation_cache_enabled": _evaluation_cache_enabled(),
+        "cache_entries": db.count_cached_evaluations(),
     }
 
 
@@ -249,6 +325,26 @@ def update_config(update: ConfigUpdate):
         os.environ["ACOA_USE_TRUSTSTORE"] = "1" if update.use_truststore else "0"
 
     return get_config()
+
+
+@app.post("/api/admin/reset-data")
+def reset_data():
+    was_running = batch_runner.status()["running"]
+    if was_running:
+        batch_runner.stop()
+
+    summary = db.reset_application_data()
+    runtime_state = batch_runner.reset_runtime_data(clear_inbox=True)
+
+    if was_running:
+        batch_runner.start()
+
+    return {
+        **summary,
+        "runtime_entries_deleted": runtime_state.get("runtime_entries_deleted", 0),
+        "batch_was_running": was_running,
+        "cache_entries_remaining": db.count_cached_evaluations(),
+    }
 
 
 @app.get("/api/files")
@@ -287,6 +383,13 @@ def _require_case(req_id: str, case_index: int) -> tuple[dict, dict, list[dict]]
     return req, extraction, cases
 
 
+def _display_entity_value(value: object) -> str:
+    if value is None:
+        return "Not extracted"
+    text = str(value).strip()
+    return text if text else "Not extracted"
+
+
 @app.patch("/api/files/{req_id}/entities")
 def edit_entities(req_id: str, patch: EntitiesPatch):
     """HITL edit: ops user corrects extracted values; validation is re-run."""
@@ -311,11 +414,17 @@ def edit_entities(req_id: str, patch: EntitiesPatch):
         if field not in extractor.ENTITY_FIELDS:
             continue
         slot = target_entities.setdefault(field, {"value": None, "confidence": 0})
-        if slot.get("value") != new_value:
-            changed.append(f"{field}: '{slot.get('value')}' → '{new_value}'")
-            slot["value"] = new_value or None
+        previous_value = slot.get("value")
+        normalized_new_value = new_value or None
+        if previous_value != normalized_new_value:
+            changed.append(f"{field}: '{previous_value}' → '{normalized_new_value}'")
+            slot["value"] = normalized_new_value
             slot["confidence"] = 1.0  # human-confirmed
-            slot["evidence"] = "Edited by operations user"
+            slot["evidence"] = (
+                f"Old Value: {_display_entity_value(previous_value)} | "
+                f"New Value: {_display_entity_value(normalized_new_value)} | "
+                "Edited by Operation User"
+            )
 
     extraction = extractor.recalculate_confidence(extraction)
     result = validation.validate(req["raw_email"], extraction)
@@ -327,11 +436,31 @@ def edit_entities(req_id: str, patch: EntitiesPatch):
 
 
 @app.post("/api/files/{req_id}/approve")
-def approve(req_id: str):
+def approve(req_id: str, action: ActionNote):
     req = _require_open(req_id)
-    if len(_multi_case_extraction(req.get("extraction"))) > 1:
-        raise HTTPException(status_code=409,
-                            detail="Use /cases/{case_index}/approve for multi-case emails.")
+    note = (action.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Approval note is required.")
+
+    extraction = req.get("extraction") or {}
+    cases = _multi_case_extraction(extraction)
+    if cases:
+        validation_result = req.get("validation") or validation.validate(req["raw_email"], extraction)
+        approved_at = db.now_iso()
+        for case in cases:
+            case["decision_status"] = "Approved"
+            case["approved_at"] = approved_at
+            case["rejected_at"] = None
+            case["approval_note"] = note
+
+        updated = _update_request_after_case_action(req_id, extraction, validation_result)
+        db.add_event(
+            req_id,
+            "approved",
+            f"Approved by operations user for all {len(cases)} cases — structured request ready for Colline submission (draft mode). Note: {note}",
+        )
+        return updated
+
     db.update_request(
         req_id,
         status="Approved",
@@ -339,34 +468,50 @@ def approve(req_id: str):
         rejected_at=None,
     )
     db.add_event(req_id, "approved",
-                 "Approved by operations user — structured request ready for Colline submission (draft mode)")
+                 "Approved by operations user — structured request ready for Colline submission (draft mode). Note: " + note)
     return db.get_request(req_id)
 
 
 @app.post("/api/files/{req_id}/reject")
 def reject(req_id: str, action: ActionNote):
     req = _require_open(req_id)
-    if len(_multi_case_extraction(req.get("extraction"))) > 1:
-        raise HTTPException(status_code=409,
-                            detail="Use /cases/{case_index}/reject for multi-case emails.")
     note = (action.note or "").strip()
     if not note:
         raise HTTPException(status_code=400, detail="Rejection note is required.")
+
+    extraction = req.get("extraction") or {}
+    cases = _multi_case_extraction(extraction)
+    if cases:
+        validation_result = req.get("validation") or validation.validate(req["raw_email"], extraction)
+        rejected_at = db.now_iso()
+        for case in cases:
+            case["decision_status"] = "Rejected"
+            case["rejected_at"] = rejected_at
+            case["approved_at"] = None
+            case["rejection_note"] = note
+
+        updated = _update_request_after_case_action(req_id, extraction, validation_result)
+        db.add_event(
+            req_id,
+            "rejected",
+            f"Rejected by operations user for all {len(cases)} cases. Note: {note}",
+        )
+        return updated
+
     db.update_request(req_id, status="Rejected", rejected_at=db.now_iso(), approved_at=None)
     db.add_event(req_id, "rejected", "Rejected by operations user. Note: " + note)
     return db.get_request(req_id)
 
 
+@app.post("/api/files/{req_id}/ask-clarifications")
 @app.post("/api/files/{req_id}/ask-customer")
 def ask_customer(req_id: str, action: ActionNote):
     req = _require_open(req_id)
-    if len(_multi_case_extraction(req.get("extraction"))) > 1:
-        raise HTTPException(status_code=409,
-                            detail="Use /cases/{case_index}/ask-customer for multi-case emails.")
     note = (action.note or "").strip()
     if not note:
-        raise HTTPException(status_code=400, detail="Ask-customer note is required.")
+        raise HTTPException(status_code=400, detail="Ask clarifications note is required.")
     extraction = req.get("extraction") or {}
+    cases = _multi_case_extraction(extraction)
     missing = (req.get("validation") or {}).get("missing_fields") or []
     if not missing:
         missing = ["confirmation of the request details"]
@@ -375,10 +520,27 @@ def ask_customer(req_id: str, action: ActionNote):
         draft = extractor.draft_clarification(req["raw_email"], extraction, missing)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not draft clarification email: {e}")
+    if cases:
+        validation_result = req.get("validation") or validation.validate(req["raw_email"], extraction)
+        extraction["clarification_draft"] = draft
+        for case in cases:
+            case["decision_status"] = AWAITING_CLARIFICATIONS_STATUS
+            case["clarification_draft"] = draft
+            case["clarification_note"] = note
+            case["approved_at"] = None
+
+        updated = _update_request_after_case_action(req_id, extraction, validation_result)
+        db.add_event(
+            req_id,
+            "clarification_drafted",
+            f"Clarification email drafted for all {len(cases)} cases. Note: {note}",
+        )
+        return updated
+
     db.update_request(
         req_id,
         clarification_draft=draft,
-        status="Awaiting Customer",
+        status=AWAITING_CLARIFICATIONS_STATUS,
         clarification_requested_at=db.now_iso(),
         approved_at=None,
     )
@@ -391,17 +553,21 @@ def ask_customer(req_id: str, action: ActionNote):
 
 
 @app.post("/api/files/{req_id}/cases/{case_index}/approve")
-def approve_case(req_id: str, case_index: int):
+def approve_case(req_id: str, case_index: int, action: ActionNote):
     req, extraction, cases = _require_case(req_id, case_index)
     validation_result = req.get("validation") or validation.validate(req["raw_email"], extraction)
+    note = (action.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Approval note is required.")
 
     case = cases[case_index]
     case["decision_status"] = "Approved"
     case["approved_at"] = db.now_iso()
     case["rejected_at"] = None
+    case["approval_note"] = note
 
     updated = _update_request_after_case_action(req_id, extraction, validation_result)
-    db.add_event(req_id, "case_approved", f"Case {case_index + 1} approved by operations user")
+    db.add_event(req_id, "case_approved", f"Case {case_index + 1} approved by operations user. Note: {note}")
     return updated
 
 
@@ -428,6 +594,7 @@ def reject_case(req_id: str, case_index: int, action: ActionNote):
     return updated
 
 
+@app.post("/api/files/{req_id}/cases/{case_index}/ask-clarifications")
 @app.post("/api/files/{req_id}/cases/{case_index}/ask-customer")
 def ask_customer_case(req_id: str, case_index: int, action: ActionNote):
     req, extraction, cases = _require_case(req_id, case_index)
@@ -436,7 +603,7 @@ def ask_customer_case(req_id: str, case_index: int, action: ActionNote):
     missing = case_val.get("missing_fields") or ["confirmation of the request details"]
     note = (action.note or "").strip()
     if not note:
-        raise HTTPException(status_code=400, detail="Ask-customer note is required.")
+        raise HTTPException(status_code=400, detail="Ask clarifications note is required.")
     missing = [*missing, f"Operations note: {note}"]
 
     case = cases[case_index]
@@ -445,7 +612,7 @@ def ask_customer_case(req_id: str, case_index: int, action: ActionNote):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not draft clarification email: {e}")
 
-    case["decision_status"] = "Awaiting Customer"
+    case["decision_status"] = AWAITING_CLARIFICATIONS_STATUS
     case["clarification_draft"] = draft
     case["clarification_note"] = note
     extraction["clarification_draft"] = draft

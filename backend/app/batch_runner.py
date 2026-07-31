@@ -105,6 +105,38 @@ class BatchRunner:
             self.interval_seconds = max(1, int(seconds))
         return self.status()
 
+    def reset_runtime_data(self, clear_inbox: bool = True) -> dict:
+        with self._run_lock:
+            self._ensure_dirs()
+            removed_entries = 0
+            target_dirs = [self.processed_dir, self.failed_dir, self.duplicates_dir]
+            if clear_inbox:
+                target_dirs.insert(0, self.inbox_dir)
+
+            for folder in target_dirs:
+                for child in folder.iterdir():
+                    if child.is_file() or child.is_symlink():
+                        child.unlink(missing_ok=True)
+                        removed_entries += 1
+                    elif child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed_entries += 1
+
+            with self._state_lock:
+                self._last_run_at = None
+                self._last_error = None
+                self._last_batch = {
+                    "processed": 0,
+                    "failed": 0,
+                    "duplicates": 0,
+                    "total_scanned": 0,
+                }
+                self._totals = {"processed": 0, "failed": 0, "duplicates": 0}
+
+        state = self.status()
+        state["runtime_entries_deleted"] = removed_entries
+        return state
+
     def run_once(self) -> dict:
         with self._run_lock:
             self._ensure_dirs()
